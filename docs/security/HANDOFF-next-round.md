@@ -17,7 +17,39 @@ branch + PR #1 are the durable record.
    go build ./... && go test ./grype/distro/...
    ```
 
-## What's already done (Finding #1 — COMPLETE)
+## What's already done (Finding #2 — COMPLETE, this round)
+
+Process-crashing panic (DoS) from version-comparator **cache poisoning**, reached during
+pre-match distro construction via the default RHEL fix channel.
+
+- Root cause: `grype/version.Version.getComparator` cached a comparator even when
+  construction failed; the cache-hit path returns a `nil` error, so a later call handed
+  back a zero-value `semanticVersion{obj: nil}` as if valid → `Compare` dereferences the
+  nil inner version → uncaught panic.
+- Trigger: an artifact marked `ID=rhel` (matches `DefaultFixChannels()` eus channel,
+  `>= 8.0`) with a **non-empty** version that fails semver parsing, e.g.
+  `VERSION_ID=test`. `NewFromRelease` validates (poisons cache), then `applyChannels`
+  compares the same `*Version` against the channel constraint (uses poisoned cache) → crash.
+- Reachable via `grype dir:/image` (`/etc/os-release`) and `grype sbom:file.json`
+  (`"distro": {"id":"rhel","versionID":"test"}`), all pre-match (no `recover()`).
+- Fix (committed): don't cache failed comparators in `grype/version/version.go`.
+- Tests (committed): `Test_getComparator_doesNotCacheFailures`,
+  `Test_Compare_afterValidate_unparseable` (`grype/version/version_test.go`);
+  `Test_NewFromRelease_unparseableVersionWithFixChannelNoPanic` (`grype/distro/distro_test.go`).
+- Report: `docs/security/2026-07-version-comparator-cache-panic.md`.
+
+### Ruled out this round (audited + fuzzed, no pre-match crash found)
+
+- syft `format.Decode` decoders (syft-json, cyclonedx json/xml, spdx json/tag-value):
+  byte-level and structure-aware (template) fuzzing, plus hand audit of the
+  `to_syft_model` conversions. JSON and XML nesting are depth-capped by the stdlib
+  (`encoding/json`, `encoding/xml` both return "exceeded max depth", no stack overflow).
+- `packageurl-go` `FromString`/`Normalize`, `cpe.New` → nvdtools `wfn.Parse` (URI + FSB):
+  fuzzed and audited; bounds-safe.
+- All `grype/version` format constructors + `Compare`/`Validate` swept by fuzzing after the
+  fix — no further panics (this also covers the hypothesis-#4 portage/gem/pacman/rpm concern).
+
+## What's already done (Finding #1 — COMPLETE, prior round)
 
 Process-crashing panic (DoS) in `grype/distro.parseVersion`.
 
@@ -49,50 +81,46 @@ Process-crashing panic (DoS) in `grype/distro.parseVersion`.
 
 ## Next round — hypotheses to pursue (ordered by promise)
 
-Goal: a second, more severe chain (ideally RCE-class), or additional distinct crashes.
-Focus on code paths that run BEFORE matching (no recover) or that recover cannot catch
-(stack overflow, OOM, concurrent map read/write, `runtime.throw`).
+Goal: a third distinct chain, or a more severe class. Focus on code paths that run BEFORE
+matching (no recover) or that recover cannot catch (stack overflow, OOM, concurrent map
+read/write, `runtime.throw`). Hypotheses #1, #2, #4 from the prior list are now RULED OUT
+(see "Ruled out this round" above) — do not re-fuzz them without a new angle.
 
-1. **syft format decoders invoked by grype's `format.Decode`** (HIGH).
-   grype/pkg/{syft_sbom_provider,cpe_provider,purl_provider}.go call
-   `github.com/anchore/syft/syft/format.Decode` in the pre-match phase. Targets:
-   - CycloneDX (`github.com/CycloneDX/cyclonedx-go`) JSON/XML decoder.
-   - SPDX (tag-value + json) decoder.
-   - syft-json decoder.
-   Build fuzz harnesses that feed crafted SBOM bytes to `format.Decode` and watch for
-   panic/OOM/stack-overflow. Attacker fully controls the file.
+1. **Archive / layer handling during image and dir scans** (HIGH, was #3).
+   If any scan path unpacks nested archives (jars within jars, image layers, tar), look
+   for zip-slip, decompression bombs (OOM), or infinite loops. Confirm whether grype or
+   syft drives extraction during a normal `grype dir:`/`grype <image>` scan (syft is the
+   cataloger; check where grype invokes it and whether attacker-controlled archive bytes
+   reach an extractor with no size/entry cap). This is the largest un-audited surface.
 
-2. **`packageurl-go` (`github.com/anchore/packageurl-go`) FromString** (MEDIUM).
-   Reached in `pkg.New` via enhancers for purl/cpe/non-syftjson SBOM inputs
-   (`grype/pkg/package.go:77`) and in `javaGroupArtifactIDFromPurl`. Malformed PURL
-   qualifiers/encoded bytes → check for panics or pathological behavior.
+2. **Concurrent map access / data races in the pre-match assembly** (MEDIUM).
+   `removePackagesByOverlap`, `FromPackages`, and the syft catalog build run over
+   attacker-sized collections. Look for a map written from multiple goroutines
+   (`runtime.throw("concurrent map ...")` bypasses recover). Run the matcher end-to-end
+   under `-race` with a large crafted SBOM.
 
-3. **Archive handling (`github.com/mholt/archives`)** (MEDIUM).
-   If any scan path unpacks nested archives (jars within jars, image layers), look for
-   zip-slip, decompression bombs (OOM), or infinite loops. Confirm whether grype or
-   syft drives extraction during a normal scan.
-
-4. **Version parsers reachable pre-match** (LOW — mostly recover-protected).
-   Matching-phase parses are caught by `callMatcherSafely`. BUT look for parses that
-   run pre-match or that cause stack overflow (unbounded recursion on attacker version
-   string) / concurrent map writes — those bypass recover. Candidates to re-audit:
-   `grype/version/portage_version.go` (nil-deref on `versionRegexp.FindStringSubmatch`
-   when the version has no digit — currently recover-protected, verify it can't be hit
-   earlier), `gem_version.go`, `pacman_version.go`, `rpm_version.go`.
-
-5. **Presenters (post-match, no recover)** (LOW — needs operator to pick the format).
+3. **Presenters (post-match, no recover)** (LOW — needs operator to pick the format).
    `grype/presenter/sarif/presenter.go` indexes `m.MatchDetails[0]`, `Locations[0]`,
    `Vulnerability.URLs[0]` without length guards. A match with empty details/locations
    would panic, but reachability depends on `-o sarif` being selected. Lower priority
    because it's not purely artifact-driven.
 
+4. **DB / vulnerability provider ingestion** (MEDIUM, new).
+   The vulnerability DB is normally trusted, but if any provider parses attacker-adjacent
+   data (e.g. version constraints from the DB compared against attacker versions), a
+   crafted constraint string could misbehave. Lower confidence on attacker control.
+
 ## Reproduction assets
 
-- Standalone repro of Finding #1 (verbatim parseVersion + NewFromRelease selection)
-  was kept in the session scratchpad only (not committed). It is trivial to recreate
-  from the report if needed.
-- PoC SBOM distro block: `{"id":"alpine","versionID":"v"}` (no `version`).
-- PoC os-release: `ID=alpine` + `VERSION_ID=v`.
+- Fuzz harnesses for this round (native Go fuzzing over `format.Decode`, `cpe.New`,
+  `packageurl.FromString`, the distro parsers, and every `version.*` format) were kept in
+  the session scratchpad only (not committed) — a throwaway `internal/fuzzsbom` package
+  whose seed loader hardcoded the syft module-cache path. Recreate from the reports if
+  needed; the durable coverage lives in the regression tests.
+- Finding #1 — PoC SBOM distro block: `{"id":"alpine","versionID":"v"}` (no `version`);
+  PoC os-release: `ID=alpine` + `VERSION_ID=v`.
+- Finding #2 — PoC SBOM distro block: `{"id":"rhel","versionID":"test"}`;
+  PoC os-release: `ID=rhel` + `VERSION_ID=test`.
 
 ## Ground rules (from the task)
 
@@ -101,4 +129,6 @@ Focus on code paths that run BEFORE matching (no recover) or that recover cannot
 - Cloning arbitrary dependency GitHub repos is blocked by the GitHub proxy (session is
   scoped to matiasinsaurralde/grype), but `go mod download` fetches all dependency
   source into the module cache — audit from there.
-- Develop on `claude/grype-zero-day-discovery-oie81z`; commit and push there.
+- Develop on the round's designated branch; commit and push there. Finding #1 was on
+  `claude/grype-zero-day-discovery-oie81z`; Finding #2 (this round) is on
+  `claude/grype-zero-day-next-round-vo8xrv` (which was based on the discovery branch).

@@ -361,3 +361,49 @@ func TestVersion_Is_AllOperators(t *testing.T) {
 		})
 	}
 }
+
+// Test_getComparator_doesNotCacheFailures is a regression test for a cache-poisoning
+// nil-pointer dereference. Previously, getComparator cached the zero-value comparator
+// even when construction failed. The cache-hit path returns a nil error, so a first
+// call that failed (e.g. via Validate) would poison the cache, and a subsequent
+// Compare/Is would receive a zero-value comparator (semanticVersion{obj: nil}) together
+// with a nil error, then dereference the nil inner value and panic. This is reachable
+// pre-match (no recover) during distro construction. See
+// docs/security/2026-07-version-comparator-cache-panic.md.
+func Test_getComparator_doesNotCacheFailures(t *testing.T) {
+	// "" is not a valid semantic version, so construction always fails.
+	v := New("", SemanticFormat)
+
+	// first interaction fails and must not poison the cache
+	err := v.Validate()
+	require.Error(t, err)
+
+	// second interaction must still report the error (not a cached, error-less success)
+	_, err = v.getComparator(v.Format)
+	require.Error(t, err)
+
+	// and comparing must return an error rather than panicking on a nil inner value
+	require.NotPanics(t, func() {
+		_, cmpErr := v.Compare(New("1.0.0", SemanticFormat))
+		require.Error(t, cmpErr)
+	})
+}
+
+// Test_Compare_afterValidate_unparseable ensures Validate() followed by Compare()/Is()
+// on an unparseable version is safe across formats (no nil-pointer panic from a poisoned
+// comparator cache).
+func Test_Compare_afterValidate_unparseable(t *testing.T) {
+	formats := []Format{
+		SemanticFormat, ApkFormat, BitnamiFormat, DebFormat, GolangFormat, MavenFormat,
+		RpmFormat, PythonFormat, GemFormat, JVMFormat, PacmanFormat,
+	}
+	for _, f := range formats {
+		t.Run(f.String(), func(t *testing.T) {
+			v := New("", f)
+			_ = v.Validate() // may or may not error depending on format, but must not poison
+			require.NotPanics(t, func() {
+				_, _ = v.Compare(New("", f))
+			})
+		})
+	}
+}

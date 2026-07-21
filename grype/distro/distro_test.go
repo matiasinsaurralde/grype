@@ -789,3 +789,25 @@ func Test_NewFromRelease_shortVersionIDNoPanic(t *testing.T) {
 		})
 	}
 }
+
+// Test_NewFromRelease_unparseableVersionWithFixChannelNoPanic is a regression test for a
+// cache-poisoning nil-pointer dereference reachable during pre-match distro construction.
+// When a distro has a fix channel with a version constraint (e.g. the default RHEL "eus"
+// channel, ">= 8.0"), NewFromRelease validates the release version as semver and then hands
+// the same *version.Version to applyChannels, which compares it against the channel
+// constraint. If the version failed to parse (e.g. VersionID="test"), the version's
+// comparator cache had been poisoned by the earlier Validate() call, so the comparison
+// dereferenced a nil inner version object and crashed the whole process (no recover runs
+// here). See docs/security/2026-07-version-comparator-cache-panic.md.
+func Test_NewFromRelease_unparseableVersionWithFixChannelNoPanic(t *testing.T) {
+	releases := []linux.Release{
+		{ID: "rhel", VersionID: "test"},              // non-semver VersionID, matches the eus channel
+		{ID: "rhel", VersionID: "v"},                 // reduces to empty core version
+		{ID: "rhel", VersionID: "abc", Version: "x"}, // both candidates fail to parse as semver
+	}
+	for _, r := range releases {
+		require.NotPanics(t, func() {
+			_, _ = NewFromRelease(r, DefaultFixChannels())
+		})
+	}
+}

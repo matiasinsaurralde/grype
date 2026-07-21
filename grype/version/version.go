@@ -82,9 +82,18 @@ func (v *Version) getComparator(format Format) (Comparator, error) {
 		err = fmt.Errorf("no comparator available for format %q", v.Format)
 	}
 
+	// only cache successfully constructed comparators. Caching a failed construction would
+	// poison the cache: the cache-hit path above returns a nil error, so a later call would
+	// hand back a zero-value comparator (e.g. semanticVersion{obj: nil}) as if it were valid,
+	// and comparing against it would dereference the nil inner value and panic. This is
+	// reachable pre-match (no recover) during distro construction, so keep failures uncached.
+	if err != nil {
+		return comparator, err
+	}
+
 	v.comparators[format] = comparator
 
-	return comparator, err
+	return comparator, nil
 }
 func (v Version) String() string {
 	return fmt.Sprintf("%s (%s)", v.Raw, v.Format)

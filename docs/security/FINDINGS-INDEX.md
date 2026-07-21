@@ -19,11 +19,17 @@ Consolidated DoS write-up (findings 1–2, operator-facing): `REPORT-2026-07-pre
 
 ## Severity ranking (most to least severe / easiest to exploit)
 
-1. **#4 Go toolchain execution (RCE-class, file-only trigger).** Merely scanning a directory
+1. **#4 Go toolchain execution (RCE-class, file-only trigger).** Merely scanning a **directory**
    that contains a `go.mod` runs the `go` toolchain in the attacker's directory (default, no
-   config, no flags, no git). Escalates to arbitrary local command execution via a
-   `go`/`toolchain` version directive that makes `go` execute a `goX.Y.Z` binary from `PATH`
-   (marker-proven), plus toolchain-download/SSRF/VCS-exec/DoS. The cleanest and "deepest" issue.
+   config, no flags, no git) — the core defect (marker-proven). Escalates to **arbitrary local
+   command execution** via a `go`/`toolchain` version directive that makes `go` execute a
+   `goX.Y.Z` binary from `PATH` (marker-proven), when an attacker-influenced `PATH` entry exists
+   (common in CI/dev; `~/go/bin`, workspace/`./bin`, `.`, or `GOTOOLCHAIN=path`). Empirically
+   bounded (see the report's boundary map): image/registry scans do **not** trigger it (on-disk
+   directory sources only); the module SSRF/`git`-clone escalation needs `GOFLAGS=-mod=mod`; and
+   a **malicious GOPROXY cannot deliver arbitrary toolchain code** because Go always verifies
+   toolchain downloads against the checksum database and ignores the repo `go.sum`. The cleanest
+   and "deepest" issue: file-only trigger, no config, no git.
 
 2. **#3 go-getter config injection (RCE-class, needs untrusted CWD).** A `.grype.yaml` in the
    directory the victim runs grype from redirects the default pre-scan DB auto-update through

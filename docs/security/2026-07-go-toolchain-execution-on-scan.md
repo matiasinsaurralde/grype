@@ -122,7 +122,7 @@ the attacker's `goX.Y.Z` from `PATH` and created the marker. It also fires under
 ### Exploitation precondition and reach
 
 `go` resolves the toolchain via `PATH` (verified: a `goX.Y.Z` placed only inside the scanned
-directory or CWD is **not** used — Go uses `exec.LookPath`). So arbitrary command execution
+directory or CWD is **not** used — Go uses `exec.LookPath`). So the **arbitrary**-command form
 requires the attacker's `goX.Y.Z` to be reachable on the victim's `PATH`. That is commonly
 satisfied and often attacker-influenceable:
 
@@ -133,21 +133,28 @@ satisfied and often attacker-influenceable:
 - `GOTOOLCHAIN=path` deployments execute a `PATH` toolchain by design.
 
 Even where `PATH` is not attacker-writable, the **base primitive (PoC #1) always holds** and
-the directive escalates to: **toolchain download+execution** from `GOPROXY` (network code
-fetched and run, chosen by the file), **SSRF** to attacker module hosts, **VCS subprocess
-execution** (`git`/`hg`) via the `direct` fallback, and **DoS** via unbounded module/toolchain
-resolution.
+the directive still drives file-chosen outbound network activity (see the boundary map).
 
-### Escalations that did NOT fire on a stock sandbox (tested, for honesty)
+### Boundary map — what each variant achieves (all empirically tested)
 
-- **cgo compiler hijack** (`#cgo CFLAGS: -B<dir>` / direct `cc` probe): grype's `go list` runs
-  `-compiled=false`, so the C toolchain is never invoked — verified with `cc`/`gcc`/`clang` and
-  `as`/`cc1`/`cpp` shims (no marker).
-- **`replace golang.org/toolchain => ./local`** and **dir-local/CWD `goX.Y.Z`**: not used (Go
-  switches toolchain before module replaces and resolves the toolchain via `PATH` only).
-- **Network fetch of a `require`/higher toolchain**: gated in the sandbox (no reachable Go
-  proxy; the tested toolchain version was not higher than installed). Reachable where the proxy
-  is reachable and the named version is higher/existing.
+| Variant | Preconditions beyond the malicious `go.mod` | Result | Verified |
+|---|---|---|---|
+| Base: `go list` runs in the attacker dir | none (default, no GOFLAGS) | untrusted toolchain execution; SSRF/DoS surface | ✅ marker |
+| Arbitrary local command | attacker `goX.Y.Z` reachable on `PATH` (or `GOTOOLCHAIN=path`) | **arbitrary RCE** | ✅ marker |
+| Outbound toolchain fetch | reachable `GOPROXY` (default proxy) | file-driven request for `golang.org/toolchain@…zip` | ✅ observer got the `.zip` GET, no GOFLAGS |
+| Real toolchain download+exec | reachable proxy + a **published** version higher than installed | downloads+executes a **Google-signed** toolchain (checksum-enforced) → DoS / trust-expansion, **not** attacker code | ✅ mechanism (fetch), — arbitrary |
+| Malicious-proxy arbitrary toolchain | attacker-controlled/MITM'd `GOPROXY` | **BLOCKED by Go**: toolchain downloads are always verified against the checksum database and **ignore the repo-local `go.sum`** (`verifying module: checksum database disabled by GOSUMDB=off`, even with a matching repo `go.sum`) | ❌ Go-side control |
+| Module SSRF / VCS `git clone` of attacker host | `GOFLAGS=-mod=mod` (grype's `go list` defaults to `-mod=readonly`, which does not fetch a bare `require`) | SSRF / attacker `git` clone | needs `-mod=mod` |
+| Image / archive scan (`docker-archive:`/registry) | — | **does NOT trigger**: the deep Go analysis runs only for on-disk **directory** sources (a real `modDir`), not image layers | ✅ negative (no `go` exec, no marker) |
+| cgo compiler hijack (`#cgo -B` / `-fplugin`) | — | **does NOT fire**: grype's `go list` uses `-compiled=false`, so the C toolchain is never invoked | ✅ negative (`cc`/`gcc`/`as`/`cc1` shims silent) |
+| `replace golang.org/toolchain => ./local`; dir-local/CWD `goX.Y.Z` | — | not used (Go switches toolchain before module replaces; resolves toolchain via `PATH` only) | ✅ negative |
+
+**Honest summary:** the *default, no-precondition* result is untrusted execution of `go list`
+(the core defect). The clean *arbitrary*-command escalation is the **`PATH` toolchain** variant,
+which needs an attacker-influenced `PATH` entry (common in CI/dev, not universal). Go's
+toolchain-always-checksum-DB verification **defends** the malicious-proxy path, and the C-compiler
+and image paths are not reachable through grype's specific `go list` flags. The right fix
+posture is therefore: do not run the Go toolchain on untrusted input at all (§6).
 
 ## 5. Ecosystem survey — is anything else exploitable this way? (No)
 

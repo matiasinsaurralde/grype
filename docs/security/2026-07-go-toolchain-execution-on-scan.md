@@ -1,174 +1,211 @@
-# Security finding: grype executes the Go toolchain (`go list`) on untrusted scanned directories
+# Security finding: grype executes the Go toolchain while scanning, enabling arbitrary command execution
 
 - **Component:** syft Go-module cataloger used by grype during directory/image scanning
   (`syft/pkg/cataloger/golang`, `UsePackagesLib` → `golang.org/x/tools/go/packages`)
-- **Class:** CWE-78 / CWE-807 — execution of an external program driven by untrusted input
-  (untrusted-input-triggered toolchain execution), escalating to SSRF (CWE-918), VCS
-  subprocess execution, network code download+execution, and DoS.
-- **Impact:** Merely **scanning a directory that contains an attacker-authored `go.mod`**
-  causes grype — with **default configuration, no flags, no git/config changes** — to spawn
-  the real `go` binary (`go list … -deps=true … all`) with its working directory set to the
-  attacker-controlled directory. This is silent and happens as part of "parsing" the project.
-- **Attacker input:** a `go.mod` file placed anywhere in the scanned tree. No user
-  interaction beyond running `grype dir:<path>` / `grype <path>` (the normal way grype is run
-  in CI on a checked-out repo).
-- **Status:** unfixed — analysis + working PoC (marker created by grype's own scan) below.
+- **Class:** CWE-78 / CWE-829 — execution of an external program / inclusion of functionality
+  from an untrusted control sphere, triggered purely by parsing an attacker-authored file.
+- **Impact:** Scanning a directory that contains an attacker-authored `go.mod` makes grype —
+  **default configuration, no flags, no git or config changes** — spawn the real `go` toolchain
+  with its working directory set to the attacker's directory. Via Go's `toolchain`/`go`
+  version directive this escalates to **arbitrary local command execution** (a `goX.Y.Z` binary
+  is executed from `PATH`), plus SSRF / VCS-exec / toolchain-download / DoS.
+- **Attacker input:** a `go.mod` file anywhere in the scanned tree (`**/go.mod`). Normal usage
+  (`grype dir:<path>`, `grype <path>`, CI scanning a checked-out repo) is enough.
+- **Status:** unfixed. Analysis, working PoCs (marker files created by grype's own scan), and a
+  fix prototype below.
 
 ---
 
 ## 1. Summary
 
-grype catalogs directories with syft. Syft's Go-module cataloger defaults to
-`UsePackagesLib: true` (`syft/pkg/cataloger/golang/config.go`:
-`DefaultCatalogerConfig()` → `UsePackagesLib: true`), whose own documentation warns it
-*"executes golang tooling found on the path in addition to potential network access."*
+grype catalogs directories/images with syft. Syft's Go-module cataloger defaults to
+`UsePackagesLib: true`, whose own config comment states it *"executes golang tooling found on
+the path in addition to potential network access."* When grype scans a tree containing a
+`go.mod` (glob `**/go.mod`), the cataloger calls `golang.org/x/tools/go/packages`
+`packages.Load(cfg, "all")` with `Dir` = the module directory, which shells out to the `go`
+binary. A vulnerability scanner running a network- and subprocess-capable build tool against
+**untrusted code** is the core defect.
 
-When grype scans a directory containing a `go.mod`, that cataloger calls
-`golang.org/x/tools/go/packages` `packages.Load(cfg, "all")` with `Dir` set to the module's
-directory. `go/packages` shells out to the **`go` binary** to enumerate the module graph.
-
-A vulnerability scanner running an arbitrary, powerful build tool (`go`, which performs
-network access, VCS subprocess execution, and toolchain download+execution) against
-**untrusted code** is a serious trust-boundary violation. It is reachable with zero
-configuration and no git tweaks — exactly the "parse a file → run a program" primitive that
-scanners are supposed to avoid.
+**This is the only ecosystem in grype that executes anything at parse time** (see §5): every
+other artifact parser is static.
 
 ## 2. Root cause
 
-`syft/pkg/cataloger/golang/config.go`:
+`syft/pkg/cataloger/golang/config.go` — default ON:
 
 ```go
 func DefaultCatalogerConfig() CatalogerConfig {
     return CatalogerConfig{
-        // ...
-        UsePackagesLib:    true,   // <-- default ON
+        UsePackagesLib:    true,   // <-- default
         MainModuleVersion: DefaultMainModuleVersionConfig(),
     }
 }
 ```
 
-`syft/pkg/cataloger/golang/parse_go_mod.go`:
+`syft/pkg/cataloger/golang/cataloger.go` — trigger glob:
+
+```go
+WithParserByGlobs(newGoModCataloger(opts).parseGoModFile, "**/go.mod")
+```
+
+`syft/pkg/cataloger/golang/parse_go_mod.go` — the sink:
 
 ```go
 if c.usePackagesLib {
-    sourcePackages, sourceModules, sourceDependencies, err = c.loadPackages(modDir, reader.Location)
-    // ...
+    sourcePackages, sourceModules, sourceDependencies, err = c.loadPackages(modDir, ...)
 }
 
 func (c *goModCataloger) loadPackages(modDir string, ...) (...) {
     cfg := &packages.Config{
-        Mode: packages.NeedModule | packages.NeedName | packages.NeedFiles |
-              packages.NeedDeps | packages.NeedImports,
-        Dir:  modDir,                                    // attacker-controlled directory
-        Tests: true,
+        Mode: NeedModule | NeedName | NeedFiles | NeedDeps | NeedImports,
+        Dir:  modDir,                          // attacker-controlled directory
         Env:  append(os.Environ(), "GOWORK=off"),
     }
-    rootPkgs, err := packages.Load(cfg, "all")           // <-- runs the `go` binary
-    // ...
+    rootPkgs, err := packages.Load(cfg, "all")  // executes the `go` binary
 }
 ```
 
-`packages.Load` with the default driver executes `go list` in `modDir`. The scanned
-directory therefore controls the working directory and the `go.mod`/`*.go`/`go.sum` inputs of
-a `go` subprocess.
+## 3. PoC #1 — grype runs `go` on the file (default, no config, no GOFLAGS)
 
-## 3. Proof of concept (grype's own scan runs a program)
-
-A "malicious artifact" is just a directory containing a `go.mod`. To capture the fact that
-grype spawns `go`, put a shim named `go` first on `PATH` (this stands in for "an arbitrary
-program was executed"; the shim writes a marker file — the classic PoC oracle):
+Malicious artifact = a directory containing a `go.mod`. Put a `go` shim first on `PATH` as the
+"an external program ran" oracle (it writes a marker, then delegates so the scan still works):
 
 ```sh
-# shim/go — records that it ran, then delegates so the scan still succeeds
+# shim/go
 #!/bin/sh
 echo "GO EXECUTED args=[$*] cwd=[$(pwd)]" >> /tmp/go_invoked.log
 exec /usr/local/go/bin/go "$@"
 ```
 
 ```sh
-# the crafted artifact
-mkdir -p scan/  && cat > scan/go.mod <<'EOF'
-module evil.example/pwn
-go 1.21
-require github.com/anchore/grype v0.90.0
-EOF
-
+mkdir scan && printf 'module e/x\ngo 1.21\n' > scan/go.mod
 PATH="$PWD/shim:$PATH" grype dir:./scan -q
 ```
 
-Observed (verbatim from a default `grype` build scanning the directory):
+Observed (verbatim, stock grype build, default env):
 
 ```
-GO EXECUTED args=[list -e -f {{context.ReleaseTags}} -- unsafe] cwd=[.../scan]
-GO EXECUTED args=[list -e -json=Name,ImportPath,Error,Dir,GoFiles,...,Module \
-   -compiled=false -test=true -export=false -deps=true -find=false \
-   -buildvcs=false -pgo=off -- all] cwd=[.../scan]
+GO EXECUTED args=[list -e -f {{context.ReleaseTags}} -- unsafe]                       cwd=[.../scan]
+GO EXECUTED args=[list -e -json=... -compiled=false -deps=true -find=false ... -- all] cwd=[.../scan]
 ```
 
-The `go` toolchain was executed twice, in the attacker's directory, purely because a `go.mod`
-was present — no configuration, no flags, no git changes. The marker file is created **by
-grype's act of scanning**, satisfying the PoC oracle.
+The `go` toolchain was executed, in the attacker's directory, purely because a `go.mod` was
+present — no config, no flags, no git changes.
 
-## 4. Impact and escalation
+## 4. PoC #2 — arbitrary local command execution via the toolchain directive
 
-Executing `go list` on untrusted input is dangerous because `go` is not a parser — it is a
-network- and subprocess-capable build tool. Consequences, by increasing environmental
-dependency:
+Go 1.21+ toolchain management: if a `go.mod` names a Go/`toolchain` version higher than the
+running toolchain, `go` resolves and **executes** a toolchain binary named `goX.Y.Z`, looked up
+on `PATH` (before/instead of downloading, under the default `GOTOOLCHAIN=auto`).
 
-1. **Untrusted-directory toolchain execution (confirmed, default):** grype runs `go` with the
-   attacker's `go.mod`/CWD. This alone is the trust-boundary break.
-2. **Denial of service (confirmed-by-design):** `go list … -deps=true all` can be steered to
-   resolve/download a large or pathological module graph, or (via a `go 1.<big>` / `toolchain`
-   directive) to attempt a full toolchain download — CPU/disk/network exhaustion during a
-   "scan".
-3. **SSRF / outbound requests (environment-dependent):** module resolution issues requests to
-   `https://<import-path>?go-get=1` and to `GOPROXY`. With the commonly-set CI value
-   `GOFLAGS=-mod=mod` (grype's invocation uses `-mod` default = `readonly`, which an
-   environment override relaxes), a `require attacker.host/x` makes grype's `go` subprocess
-   reach out to an attacker-chosen host.
-4. **VCS subprocess execution (environment-dependent):** with the `,direct` GOPROXY fallback
-   (default component) and `-mod=mod`, modules absent from the proxy are fetched via
-   `git`/`hg`/`bzr`/`svn`/`fossil` — turning a scanned `go.mod` into attacker-directed
-   `git clone` invocations.
-5. **Network code download + execution (environment-dependent):** a `toolchain goX.Y.Z`
-   directive with `GOTOOLCHAIN=auto` downloads and **executes** a toolchain; and where the git
-   `ext` protocol is permitted or a custom/attacker `GOPROXY`/`GONOSUMCHECK` is configured
-   (all common in CI), this reaches full arbitrary command execution.
+Malicious `go.mod` (two lines is enough — no explicit `toolchain` line required):
 
-### Escalations that did **not** fire under a default sandbox (tested, for honesty)
+```
+module e/x
+go 1.99.0
+```
+
+With a same-named executable reachable on `PATH` (the arbitrary payload):
+
+```sh
+# an attacker-provided binary named exactly like the requested toolchain
+printf '#!/bin/sh\ntouch /tmp/pwned_toolchain\n' > bindir/go1.99.0 && chmod +x bindir/go1.99.0
+PATH="$PWD/bindir:$PATH" grype dir:./scan-bare -q
+# => /tmp/pwned_toolchain is created: grype executed the attacker binary
+```
+
+**Verified** (both a `toolchain go1.99.99` directive and a bare `go 1.99.0` directive) under
+**default `GOTOOLCHAIN=auto`, no GOFLAGS, no network, no cgo, no git**: grype's scan executed
+the attacker's `goX.Y.Z` from `PATH` and created the marker. It also fires under
+`GOTOOLCHAIN=path` (a setting some CI uses as "hardening").
+
+### Exploitation precondition and reach
+
+`go` resolves the toolchain via `PATH` (verified: a `goX.Y.Z` placed only inside the scanned
+directory or CWD is **not** used — Go uses `exec.LookPath`). So arbitrary command execution
+requires the attacker's `goX.Y.Z` to be reachable on the victim's `PATH`. That is commonly
+satisfied and often attacker-influenceable:
+
+- `~/go/bin` (`GOBIN`/`GOPATH/bin`) is on `PATH` in essentially every Go dev/CI environment and
+  is user-writable — any prior low-value write primitive (or a second malicious module the
+  victim `go install`ed) lands the payload.
+- CI runners frequently place the workspace, `./bin`, `node_modules/.bin`, or `.` on `PATH`.
+- `GOTOOLCHAIN=path` deployments execute a `PATH` toolchain by design.
+
+Even where `PATH` is not attacker-writable, the **base primitive (PoC #1) always holds** and
+the directive escalates to: **toolchain download+execution** from `GOPROXY` (network code
+fetched and run, chosen by the file), **SSRF** to attacker module hosts, **VCS subprocess
+execution** (`git`/`hg`) via the `direct` fallback, and **DoS** via unbounded module/toolchain
+resolution.
+
+### Escalations that did NOT fire on a stock sandbox (tested, for honesty)
 
 - **cgo compiler hijack** (`#cgo CFLAGS: -B<dir>` / direct `cc` probe): grype's `go list` runs
-  with `-compiled=false`, so the C toolchain is **not** invoked — verified with `cc`/`gcc`/
-  `clang` and `as`/`cc1`/`cpp` shims (no marker). The classic cgo-flag RCE is therefore not
-  reachable through grype's specific flags on a stock setup.
-- **`replace golang.org/toolchain => ./local`:** Go resolves toolchain switching before module
-  replaces, so a local malicious toolchain is not executed (no marker).
-- **Bare `require attacker.host/x`:** under the default `-mod=readonly` and `go list -e`, no
-  `git`/download fired in the sandbox.
+  `-compiled=false`, so the C toolchain is never invoked — verified with `cc`/`gcc`/`clang` and
+  `as`/`cc1`/`cpp` shims (no marker).
+- **`replace golang.org/toolchain => ./local`** and **dir-local/CWD `goX.Y.Z`**: not used (Go
+  switches toolchain before module replaces and resolves the toolchain via `PATH` only).
+- **Network fetch of a `require`/higher toolchain**: gated in the sandbox (no reachable Go
+  proxy; the tested toolchain version was not higher than installed). Reachable where the proxy
+  is reachable and the named version is higher/existing.
 
-The honest characterization: **the default, no-precondition result is "grype executes the Go
-toolchain on untrusted directories,"** with SSRF / VCS-exec / network-code-exec / DoS
-escalations that become reachable under the environment conditions (`-mod=mod`, custom
-`GOPROXY`, `GONOSUMCHECK`, permissive git protocols, `toolchain` directives) that are common in
-real CI runners. A security scanner should not execute the target's build toolchain at all.
+## 5. Ecosystem survey — is anything else exploitable this way? (No)
 
-## 5. Remediation
+Empirically scanned one directory containing 18 crafted files across ~15 ecosystems (Go, npm,
+Python, Ruby, PHP, Rust, Java, .NET, apk, dpkg, Dart, Elixir, GitHub Actions, Terraform) with a
+55-tool `PATH` shim set (`git hg svn bzr gcc cc clang as ld tar unzip unpigz zstd xz dpkg rpm ar
+sh bash python ruby gem bundle node npm mvn java dotnet cargo nix pkg-config …`). Result:
 
-1. **Do not run the Go toolchain on untrusted input.** In grype, disable syft's
-   `UsePackagesLib` for the Go cataloger by default (parse `go.mod`/`go.sum` statically with
-   `golang.org/x/mod/modfile`, which syft already does as the base case). Make toolchain
-   execution strictly opt-in and loudly documented as unsafe for untrusted targets.
-2. If source analysis must remain, sandbox the `go` subprocess: force
-   `GOFLAGS=-mod=readonly`, `GOPROXY=off`, `GOTOOLCHAIN=local`, `GONOSUMCHECK` unset,
-   `GIT_ALLOW_PROTOCOL=` (empty), no network, and a scratch `GOMODCACHE`/`GOPATH` — so `go
-   list` cannot download modules, switch toolchains, spawn VCS tools, or reach the network.
-3. Document clearly that scanning untrusted repositories executes the Go toolchain, so
-   operators can gate it (e.g. `--exclude` go.mod, or run under an isolated user/namespace).
+- **Only `go` was executed.** No other tool fired.
+- The npm `preinstall` script, the Ruby `.gemspec` backtick, and `setup.py`'s `os.system` were
+  **not** evaluated (parsed statically). Static confirmation: of syft's ~40 catalogers, only
+  `golang` imports `os/exec`/`go/packages` at runtime.
 
-## 6. Relationship to the other findings on this branch
+So the parse-time execution vector is **Go-specific**; all other artifact types are static
+parsers. (Grype's *other* code-execution exposure is on the DB-update path, documented
+separately in `2026-07-config-injection-go-getter-rce.md`.)
 
-This is distinct from — and matches the "deeper / easier to exploit" description better than —
-the config-injection go-getter finding: it needs **no configuration change and no git
-protocol tricks**, only a `go.mod` in the scanned tree, and it fires during ordinary
-directory cataloging rather than the DB-update path. It is unrelated to the two version/distro
-DoS findings.
+## 6. Fix prototype (documentation only — not applied as code)
+
+The root fix is to never run the Go toolchain on untrusted input. Grype already receives fully
+static `go.mod` parsing as the base case; only the opt-in `UsePackagesLib` deep analysis shells
+out. Grype constructs the syft config in `cmd/grype/cli/commands/root.go:getProviderConfig`, so
+the change is one line there:
+
+```go
+// cmd/grype/cli/commands/root.go
+func getProviderConfig(opts *options.Grype) pkg.ProviderConfig {
+    cfg := syft.DefaultCreateSBOMConfig()
+    cfg.Packages.JavaArchive.IncludeIndexedArchives = opts.Search.IncludeIndexedArchives
+    cfg.Packages.JavaArchive.IncludeUnindexedArchives = opts.Search.IncludeUnindexedArchives
+
++   // Do not execute the Go toolchain (`go list`) on untrusted scan targets. `go/packages`
++   // shells out to `go`, which — via a go.mod `go`/`toolchain` directive — will execute a
++   // `goX.Y.Z` binary from PATH and can download+run a toolchain / spawn VCS tools / reach the
++   // network. Static go.mod parsing (the base path) is sufficient for vulnerability matching.
++   cfg.Packages.Golang.UsePackagesLib = false
+
+    cfg.Compliance.MissingVersion = cataloging.ComplianceActionDrop
+    // ...
+}
+```
+
+Field path verified against syft v1.42.3 (`pkgcataloging.Config.Golang golang.CatalogerConfig`,
+which has `UsePackagesLib bool`). Grype could additionally expose this as an explicit,
+default-false option (e.g. `golang.deep-source-analysis`) so users who opt in are warned it is
+unsafe for untrusted targets.
+
+Defense in depth if deep analysis must remain available: sandbox the `go` subprocess —
+`GOTOOLCHAIN=local`, `GOFLAGS=-mod=readonly`, `GOPROXY=off`, `GONOSUMCHECK` unset,
+`GIT_ALLOW_PROTOCOL=` empty, no network, a scratch `GOMODCACHE`/`GOPATH`, and (ideally) a
+restricted `PATH` — so `go list` cannot switch toolchains, download modules, spawn VCS tools, or
+reach the network.
+
+## 7. Relationship to the other findings on this branch
+
+This is the "deeper / easier" file-parse-triggered execution: it needs **no configuration
+change and no git tricks**, only a `go.mod` in the scanned tree, and fires during ordinary
+cataloging. It is distinct from the go-getter DB-update config-injection finding
+(`2026-07-config-injection-go-getter-rce.md`) and from the two version/distro DoS findings
+(`2026-07-distro-version-parse-panic.md`, `2026-07-version-comparator-cache-panic.md`). See
+`REPORT-2026-07-pre-match-dos-findings.md` for the DoS write-ups and the index below.

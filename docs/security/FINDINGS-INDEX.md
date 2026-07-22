@@ -14,6 +14,8 @@ Branch: `claude/grype-zero-day-next-round-vo8xrv`.
 | 4 | Go toolchain execution while scanning | Code exec (CWE-78/829) | `go.mod` in scanned tree | yes | analyzed + PoC + fix proto | `2026-07-go-toolchain-execution-on-scan.md` |
 
 Consolidated DoS write-up (findings 1–2, operator-facing): `REPORT-2026-07-pre-match-dos-findings.md`.
+Precondition-free RCE analysis (why a zero-precondition `clone → grype` RCE is blocked, and
+where to look next): `2026-07-precondition-free-rce-brainstorm.md`.
 
 ---
 

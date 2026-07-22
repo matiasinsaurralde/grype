@@ -90,6 +90,41 @@ runs does **not** give an attacker-controlled write path:
 
 So the archive surface does not yield an arbitrary file write via a default scan.
 
+## Bare developer laptop — the strict case (empirical verdict)
+
+Threat model: a developer clones a repo and runs grype (default build/config/env, from inside
+the clone). No PATH edits, no `GOFLAGS`, no attacker access to the machine beyond the repo
+contents.
+
+**`strace -f -e trace=execve` of a real scan** (`grype dir:<cloned-git-repo>` where the repo
+is a git repo with `go.mod` + `main.go`) shows grype's *entire* subprocess surface is:
+
+```
+execve("/usr/local/go/bin/go", ["go", "list", "-e", …, "all"], …)   # + grype itself
+```
+
+Nothing else — no `git`, `cc`, `cgo`, `pkg-config`, `sh`, or any helper. And `go list` (with
+grype's exact flags) spawns **no** child of its own, even for a package with
+`import "C"` + `#cgo pkg-config: …` + `#cgo CFLAGS: -B…` (verified: no `cc`/`cc1`/`pkg-config`
+execve — `-compiled=false` means cgo/compiler are never invoked).
+
+So on a bare laptop the only program grype runs is `go`, and `go` executes attacker code only
+via the toolchain switch — which Vector A shows is unreachable for a repo-only attacker
+(absolute-`PATH`/checksum-download only; the repo cannot write to `PATH`, `~/go/bin`, or
+`GOMODCACHE` via clone-or-scan, and `go list` never runs `go install`). Even the near-universal
+Go-dev setup (`~/go/bin` on `PATH`) does not help: the attacker still cannot place a binary
+there.
+
+The decompressor sub-vector of Vector B is also closed: grype's `untar` **skips
+symlinks/hardlinks and rejects `..` entries**, and go-getter's zip/tgz decompressors likewise
+guard `..`, so an attacker-shipped `.grype.yaml` + local archive cannot achieve an arbitrary
+file write.
+
+**Verdict:** no precondition-free arbitrary command execution was found for the bare-laptop
+`clone → grype` flow. The precondition-free *trigger* (grype runs `go` on the repo) is real and
+is itself worth removing, but converting it to *attacker code* needs a precondition Go's
+hardening specifically denies to a repo-only attacker.
+
 ## Assessment
 
 A **fully precondition-free arbitrary-command RCE was not found.** Every repo-content-driven
